@@ -1,0 +1,1 @@
+# openwrt-trusted-page-settings
