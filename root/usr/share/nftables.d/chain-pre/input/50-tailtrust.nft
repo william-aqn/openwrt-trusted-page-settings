@@ -1,0 +1,2 @@
+iifname "tailscale0" meta nfproto ipv6 counter drop comment "tailtrust: IPv4 device list only"
+iifname "tailscale0" ip saddr != @ts_trusted counter drop comment "tailtrust: deny untrusted devices"

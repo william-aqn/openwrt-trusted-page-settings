@@ -1,0 +1,165 @@
+#!/bin/sh
+set -eu
+umask 077
+
+if [ "${1:-}" = check ]; then
+    exec ucode /usr/libexec/tailtrust-validate.uc "${2:-/etc/config}"
+fi
+[ "$#" -eq 0 ] || exit 2
+mkdir -p /var/run/tailtrust
+exec 9>/var/lock/tailtrust.lock
+flock -x -w 20 9
+work=$(mktemp -d /tmp/tailtrust.XXXXXX)
+changed=0
+complete=0
+settings=''
+
+set_status() {
+    ucode -e 'import { writefile } from "fs"; writefile(ARGV[0], sprintf("%J\n", {state:ARGV[1], message:ARGV[2], updated:ARGV[3], count:int(ARGV[4])}));' \
+        "$work/status.json" "$1" "$2" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "${count:-0}"
+    chmod 644 "$work/status.json"
+    mv "$work/status.json" /var/run/tailtrust/status.json
+}
+
+reload_transmission() {
+    for daemon_pid in $(pidof transmission-daemon || true); do
+        kill -HUP "$daemon_pid"
+    done
+}
+
+reload_samba() {
+    for daemon_pid in $(pidof smbd || true); do
+        kill -HUP "$daemon_pid"
+    done
+}
+
+replace_firewall_set() {
+    {
+        echo 'flush set inet fw4 ts_trusted'
+        if [ -s "$1" ]; then
+            printf 'add element inet fw4 ts_trusted { '
+            awk 'BEGIN { separator="" } { printf "%s%s", separator, $0; separator=", " }' "$1"
+            printf ' }\n'
+        fi
+    } > "$work/replace-set.nft"
+    # fw4 reload preserves set contents; replace this set in one nft transaction.
+    nft -f "$work/replace-set.nft"
+}
+
+finish() {
+    result=$?
+    trap - EXIT
+    if [ "$complete" -ne 1 ]; then
+        if [ "$changed" -eq 1 ]; then
+            uci -q revert firewall || true
+            uci -q revert transmission || true
+            cp -p "$work/firewall" /etc/config/firewall
+            cp -p "$work/transmission" /etc/config/transmission
+            cp -p "$work/samba-template" /etc/samba/smb.conf.template
+            [ ! -f "$work/samba-runtime" ] || cat "$work/samba-runtime" > /var/etc/smb.conf
+            [ ! -f "$work/transmission-settings" ] || cat "$work/transmission-settings" > "$settings"
+            /etc/init.d/firewall reload >> "$work/apply.log" 2>&1 || true
+            replace_firewall_set "$work/previous-ips" || true
+            reload_samba || true
+            reload_transmission || true
+        fi
+        set_status error 'Apply failed. Previous service settings were kept; check the system log.' || true
+        [ ! -f "$work/apply.log" ] || logger -t tailtrust < "$work/apply.log"
+        result=1
+    fi
+    rm -rf "$work"
+    exit "$result"
+}
+trap finish EXIT
+
+ucode /usr/libexec/tailtrust-validate.uc /etc/config > "$work/ips" 2> "$work/apply.log"
+count=$(wc -l < "$work/ips" | tr -d ' ')
+set_status applying 'Updating firewall, Samba and Transmission.'
+
+# Do not commit unrelated configuration edits left by another administrator.
+[ -z "$(uci changes firewall)" ]
+[ -z "$(uci changes transmission)" ]
+cp -p /etc/config/firewall "$work/firewall"
+{ uci -q get firewall.ts_trusted.entry || true; } | tr ' ' '\n' | sed '/^$/d' > "$work/previous-ips"
+cp -p /etc/config/transmission "$work/transmission"
+cp -p /etc/samba/smb.conf.template "$work/samba-template"
+[ ! -f /var/etc/smb.conf ] || cp -p /var/etc/smb.conf "$work/samba-runtime"
+settings_dir=$(uci -q get transmission.main.config_dir)
+settings="$settings_dir/settings.json"
+if [ -f "$settings" ]; then
+    cp -p "$settings" "$work/transmission-settings"
+elif pidof transmission-daemon >/dev/null; then
+    echo 'Running Transmission has no accessible settings file.' >> "$work/apply.log"
+    exit 1
+fi
+
+samba_allow=$(uci -q get tailtrust.settings.samba_allow)
+rpc_allow=$(uci -q get tailtrust.settings.transmission_allow | tr ' ' ',')
+rpc_hosts=$(uci -q get tailtrust.settings.transmission_hosts | tr ' ' ',')
+[ -n "$samba_allow" ] && [ -n "$rpc_allow" ] && [ -n "$rpc_hosts" ]
+while IFS= read -r ip; do
+    samba_allow="$samba_allow $ip"
+    rpc_allow="$rpc_allow,$ip"
+done < "$work/ips"
+
+make_samba() {
+    awk -v allowed="$samba_allow" '
+        /^[[:space:]]*hosts allow[[:space:]]*=/ { print "    hosts allow = " allowed; found++; next }
+        { print }
+        END { if (found != 1) exit 1 }
+    ' "$1" > "$2"
+}
+make_samba "$work/samba-template" "$work/samba-next"
+testparm -s "$work/samba-next" >/dev/null 2>> "$work/apply.log"
+if [ -f "$work/samba-runtime" ]; then
+    make_samba "$work/samba-runtime" "$work/samba-runtime-next"
+    testparm -s "$work/samba-runtime-next" >/dev/null 2>> "$work/apply.log"
+fi
+if [ -f "$work/transmission-settings" ]; then
+    ucode /usr/libexec/tailtrust-json.uc "$settings" "$work/transmission-next" "$rpc_allow" "$rpc_hosts"
+fi
+
+changed=1
+uci set firewall.ts_trusted=ipset
+uci set firewall.ts_trusted.name='ts_trusted'
+uci set firewall.ts_trusted.family='ipv4'
+uci set firewall.ts_trusted.match='src_ip'
+uci -q delete firewall.ts_trusted.entry || true
+while IFS= read -r ip; do
+    uci add_list "firewall.ts_trusted.entry=$ip"
+done < "$work/ips"
+for rule in ts_mesh_admin ts_mesh_ping ts_mesh_exit ts_mesh_home ts_mesh_podkop; do
+    [ "$(uci -q get "firewall.$rule")" = rule ]
+    uci -q delete "firewall.$rule.src_ip" || true
+    uci set "firewall.$rule.ipset=ts_trusted"
+    uci set "firewall.$rule.enabled=1"
+done
+fw4 check >> "$work/apply.log" 2>&1
+uci set "transmission.main.rpc_whitelist=$rpc_allow"
+uci set transmission.main.rpc_whitelist_enabled='true'
+uci set "transmission.main.rpc_host_whitelist=$rpc_hosts"
+uci set transmission.main.rpc_host_whitelist_enabled='true'
+uci commit firewall
+uci commit transmission
+cat "$work/samba-next" > /etc/samba/smb.conf.template
+[ ! -f "$work/samba-runtime-next" ] || cat "$work/samba-runtime-next" > /var/etc/smb.conf
+# Preserve the inode used by Transmission's read-only jail bind mount.
+[ ! -f "$work/transmission-next" ] || cat "$work/transmission-next" > "$settings"
+/etc/init.d/firewall reload >> "$work/apply.log" 2>&1
+replace_firewall_set "$work/ips"
+reload_samba
+reload_transmission
+
+# Revoke established sessions as well as new connections for removed peers.
+if [ -f /var/run/tailtrust/applied-ips ]; then
+    while IFS= read -r old_ip; do
+        if ! grep -qxF "$old_ip" "$work/ips"; then
+            conntrack -D -s "$old_ip" >> "$work/apply.log" 2>&1 || true
+            conntrack -D -d "$old_ip" >> "$work/apply.log" 2>&1 || true
+        fi
+    done < /var/run/tailtrust/applied-ips
+fi
+cp "$work/ips" /var/run/tailtrust/applied-ips
+set_status ok 'Firewall, Samba and Transmission are up to date.'
+logger -t tailtrust "Applied $count trusted devices."
+complete=1

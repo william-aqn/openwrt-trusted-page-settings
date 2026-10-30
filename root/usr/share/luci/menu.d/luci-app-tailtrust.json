@@ -1,0 +1,8 @@
+{
+  "admin/services/tailtrust": {
+    "title": "Trusted devices",
+    "order": 65,
+    "action": { "type": "view", "path": "tailtrust/settings" },
+    "depends": { "acl": ["luci-app-tailtrust"], "uci": { "tailtrust": true } }
+  }
+}

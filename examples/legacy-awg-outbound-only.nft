@@ -1,0 +1,3 @@
+# Optional rule for the input and forward chain-pre directories.
+# Use only when awg31 is an outbound-only tunnel, as in the original Flint setup.
+iifname "awg31" ct direction original counter drop comment "tailtrust: legacy AWG outbound only"

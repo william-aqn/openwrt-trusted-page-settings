@@ -1,0 +1,8 @@
+/dist/
+*.private.*
+*.ppk
+*.key
+*.btskey
+tailscaled.state
+awg-profile.json
+.DS_Store

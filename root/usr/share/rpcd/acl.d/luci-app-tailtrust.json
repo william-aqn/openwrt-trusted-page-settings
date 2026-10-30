@@ -1,0 +1,11 @@
+{
+  "luci-app-tailtrust": {
+    "description": "Manage trusted Tailscale devices",
+    "read": {
+      "uci": ["tailtrust"],
+      "ubus": { "file": ["read"] },
+      "file": { "/var/run/tailtrust/status.json": ["read"] }
+    },
+    "write": { "uci": ["tailtrust"] }
+  }
+}

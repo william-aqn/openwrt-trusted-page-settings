@@ -1,0 +1,14 @@
+config settings 'settings'
+    list samba_allow '127.0.0.1'
+    list samba_allow '::1'
+    list samba_allow '192.168.8.0/24'
+    list transmission_allow '127.0.0.1'
+    list transmission_allow '192.168.8.*'
+    list transmission_hosts 'localhost'
+    list transmission_hosts '192.168.8.1'
+    # Add your router's Tailscale address and any other allowed HTTP host names.
+
+config device 'example'
+    option name 'Replace with your device'
+    option ip '100.64.10.2'
+    option enabled '0'
